@@ -1,55 +1,104 @@
-# Copyright © 2023 Intel Corporation. All rights reserved.
+# Copyright © 2024 Intel Corporation. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-.PHONY: build-all build-soc build-dgpu run-camera-simulator clean clean-simulator clean-ovms-client clean-grpc-go clean-model-server clean-ovms clean-all build-grpc-go clean-results
+.PHONY: build build-realsense run down
+.PHONY: build-telegraf run-telegraf run-portainer clean-all clean-results clean-telegraf clean-models down-portainer
+.PHONY: download-models clean-test run-demo run-headless
 
 MKDOCS_IMAGE ?= asc-mkdocs
+PIPELINE_COUNT ?= 1
+TARGET_FPS ?= 14.95
+DOCKER_COMPOSE ?= docker-compose.yml
+RESULTS_DIR ?= $(PWD)/results
+RETAIL_USE_CASE_ROOT ?= $(PWD)
 
-build-all: build-soc build-dgpu
+download-models:
+	./download_models/downloadModels.sh
 
-build-soc:
-	echo "Building for SOC (e.g. TGL/ADL/Xeon SP/etc) HTTPS_PROXY=${HTTPS_PROXY} HTTP_PROXY=${HTTP_PROXY}"
-	docker build --no-cache --build-arg HTTPS_PROXY=${HTTPS_PROXY} --build-arg HTTP_PROXY=${HTTP_PROXY} -t sco-soc:2.0 -f Dockerfile.soc .
+download-sample-videos:
+	cd performance-tools/benchmark-scripts && ./download_sample_videos.sh
 
-build-dgpu:
-	echo "Building for dgpu Arc/Flex HTTPS_PROXY=${HTTPS_PROXY} HTTP_PROXY=${HTTP_PROXY}"
-	docker build --no-cache --build-arg HTTPS_PROXY=${HTTPS_PROXY} --build-arg HTTP_PROXY=${HTTP_PROXY} -t sco-dgpu:2.0 -f Dockerfile.dgpu .
+clean-models:
+	@find ./models/ -mindepth 1 -maxdepth 1 -type d -exec sudo rm -r {} \;
 
-run-camera-simulator:
-	./camera-simulator/camera-simulator.sh
+run-smoke-tests: | download-models update-submodules download-sample-videos
+	@echo "Running smoke tests for OVMS profiles"
+	@./smoke_test.sh > smoke_tests_output.log
+	@echo "results of smoke tests recorded in the file smoke_tests_output.log"
+	@grep "Failed" ./smoke_tests_output.log || true
+	@grep "===" ./smoke_tests_output.log || true
 
-clean:
-	./clean-containers.sh automated-self-checkout
+update-submodules:
+	@git submodule update --init --recursive
+	@git submodule update --remote --merge
 
-clean-simulator:
-	./clean-containers.sh camera-simulator
+build:
+	docker build --build-arg HTTPS_PROXY=${HTTPS_PROXY} --build-arg HTTP_PROXY=${HTTP_PROXY} --target build-default -t dlstreamer:dev -f src/Dockerfile src/
 
-build-ovms-client:
-	echo "Building for OVMS Client HTTPS_PROXY=${HTTPS_PROXY} HTTP_PROXY=${HTTP_PROXY}"
-	docker build --build-arg HTTPS_PROXY=${HTTPS_PROXY} --build-arg HTTP_PROXY=${HTTP_PROXY} -t ovms-client:latest -f Dockerfile.ovms-client .
+build-realsense:
+	docker build --build-arg HTTPS_PROXY=${HTTPS_PROXY} --build-arg HTTP_PROXY=${HTTP_PROXY} --target build-realsense -t dlstreamer:realsense -f src/Dockerfile src/
 
-build-ovms-server: get-server-code
-	@echo "Building for OVMS Server HTTPS_PROXY=${HTTPS_PROXY} HTTP_PROXY=${HTTP_PROXY}"
-	$(MAKE) -C model_server docker_build OV_USE_BINARY=0 BASE_OS=ubuntu OV_SOURCE_BRANCH=seg_and_bit_gpu_poc
-	docker build --build-arg HTTPS_PROXY=${HTTPS_PROXY} --build-arg HTTP_PROXY=${HTTP_PROXY} -f $(PWD)/configs/opencv-ovms/models/2022/Dockerfile.updateDevice -t update_config:dev $(PWD)/configs/opencv-ovms/models/2022/.
+build-pipeline-server: | download-models update-submodules download-sample-videos
+	docker build -t dlstreamer:pipeline-server -f src/pipeline-server/Dockerfile.pipeline-server src/pipeline-server
 
-get-server-code:
-	@if [ -d "./model_server" ]; then echo "clean up the existing model_server directory"; rm -rf ./model_server; fi
-	echo "Getting model_server code"
-	git clone https://github.com/gsilva2016/model_server 
+run:
+	docker compose -f src/$(DOCKER_COMPOSE) up -d
 
-clean-ovms-client: clean-grpc-go
-	./clean-containers.sh ovms-client
+run-render-mode:
+	xhost +local:docker
+	RENDER_MODE=1 docker compose -f src/$(DOCKER_COMPOSE) up -d
 
-clean-grpc-go:
-	./clean-containers.sh dev
+down:
+	docker compose -f src/$(DOCKER_COMPOSE) down
 
-clean-model-server:
-	./clean-containers.sh model-server
+run-demo: | download-models update-submodules download-sample-videos
+	@echo "Building automated self checkout app"	
+	$(MAKE) build
+	@echo Running automated self checkout pipeline
+	$(MAKE) run-render-mode
 
-clean-ovms: clean-ovms-client clean-model-server
+run-headless: | download-models update-submodules download-sample-videos
+	@echo "Building automated self checkout app"
+	$(MAKE) build
+	@echo Running automated self checkout pipeline
+	$(MAKE) run
 
-clean-all: clean clean-ovms clean-simulator clean-results
+run-pipeline-server: | build-pipeline-server
+	RETAIL_USE_CASE_ROOT=$(RETAIL_USE_CASE_ROOT) docker compose -f src/pipeline-server/docker-compose.pipeline-server.yml up -d
+
+down-pipeline-server:
+	docker compose -f src/pipeline-server/docker-compose.pipeline-server.yml down
+
+build-benchmark:
+	cd performance-tools && $(MAKE) build-benchmark-docker
+
+benchmark: build-benchmark download-models
+	cd performance-tools/benchmark-scripts && python benchmark.py --compose_file ../../src/docker-compose.yml --pipeline $(PIPELINE_COUNT)
+
+benchmark-stream-density: build-benchmark download-models
+	cd performance-tools/benchmark-scripts && python benchmark.py --compose_file ../../src/docker-compose.yml --target_fps $(TARGET_FPS) --density_increment 1 --results_dir $(RESULTS_DIR)
+
+build-telegraf:
+	cd telegraf && $(MAKE) build
+
+run-telegraf:
+	cd telegraf && $(MAKE) run
+
+clean-telegraf: 
+	./clean-containers.sh influxdb2
+	./clean-containers.sh telegraf
+
+run-portainer:
+	docker compose -p portainer -f docker-compose-portainer.yml up -d
+
+down-portainer:
+	docker compose -p portainer -f docker-compose-portainer.yml down
+
+clean-results:
+	rm -rf results/*
+
+clean-all: 
+	docker rm -f $(docker ps -aq)
 
 docs: clean-docs
 	mkdocs build
@@ -63,6 +112,7 @@ docs-builder-image:
 
 build-docs: docs-builder-image
 	docker run --rm \
+		-u $(shell id -u):$(shell id -g) \
 		-v $(PWD):/docs \
 		-w /docs \
 		$(MKDOCS_IMAGE) \
@@ -71,16 +121,17 @@ build-docs: docs-builder-image
 serve-docs: docs-builder-image
 	docker run --rm \
 		-it \
+		-u $(shell id -u):$(shell id -g) \
 		-p 8008:8000 \
 		-v $(PWD):/docs \
 		-w /docs \
 		$(MKDOCS_IMAGE)
 
-build-grpc-go: build-ovms-client
-	cd configs/opencv-ovms/grpc_go && make build
-
 clean-docs:
 	rm -rf docs/
 
-clean-results:
-	sudo rm -rf results/*
+helm-package:
+	helm package helm/ -u -d .deploy
+	helm package helm/
+	helm repo index .
+	helm repo index --url https://github.com/intel-retail/automated-self-checkout .
